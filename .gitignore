@@ -1,0 +1,17 @@
+*.lo
+*.la
+*.o
+*.tar.gz
+*.rpm
+*.diff
+*.patch
+.libs
+.deps
+
+# Softlinks to test and log
+log
+*.vol
+
+# cmocka unit tests
+*.log
+
