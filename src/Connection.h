@@ -1,6 +1,6 @@
 
-#ifndef _RDMACONNECTION_H_
-#define _RDMACONNECTION_H_ 1
+#ifndef RDMA_CONNECTION_H_
+#define RDMA_CONNECTION_H_ 1
 
 #include <boost/shared_ptr.hpp>
 #include <string>
