@@ -437,7 +437,7 @@ fs_rdma_cm_handle_connect_request (struct rdma_cm_event *event)
         conn_param.retry_count = config->retry_count;
         conn_param.rnr_retry_count = 7; /* infinite retry */
 
-        ret = rdma_accept(child_cm_id, &conn_param);
+        ret = rdma_accept(rdma_ctx->cm_id, &conn_param);
         if (ret < 0) {
                 fprintf(stderr, "rdma_accept failed \n");
                 fs_rdma_cm_handle_disconnect ();
@@ -512,10 +512,10 @@ fs_rdma_cm_handle_connect_init (struct rdma_cm_event *event)
             ret = -1;
         }
 
-        rdma_ctx->connected = 1;
-
         if (ret < 0) {
                 rdma_disconnect (rdma_ctx->cm_id);
+        } else {
+            rdma_ctx->connected = 1;
         }
 
         return ret;
@@ -523,11 +523,242 @@ fs_rdma_cm_handle_connect_init (struct rdma_cm_event *event)
 
 
 static int
-gf_rdma_cm_handle_event_error ()
+fs_rdma_cm_handle_event_error ()
 {
 
         fs_rdma_cm_handle_disconnect ();
 
         return 0;
+}
+
+
+static int32_t
+fs_rdma_connect (const char *ip_addr, int port)
+{
+
+        int32_t ret = 0;
+        socklen_t sockaddr_len = 0;
+
+
+        fs_rdma_create_ctx();
+
+        struct addrinfo *res;
+        struct sockaddr_in sin;
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        getaddrinfo(ip_addr, port, hints, &res);
+
+        memcpy(&sin, res->ai_addr, sizeof(sin));
+        sin.sin_port = htons((unsigned short)config->port);
+
+        freeaddrinfo(res);//avoid memory leak
+
+        ret = rdma_resolve_addr (rdma_ctx->cm_id, NULL, (struct sockaddr *)&sin, TIMEOUT_IN_MS);
+
+        if (ret != 0)
+        {
+            fprintf(stderr, "rdma_resolve_addr failed\n");
+        }
+
+        return ret;
+}
+
+
+static int32_t fs_rdma_listen (char *ip_addr, int port)
+//ip_addr可以为NULL
+{
+    int ret = -1;
+
+    struct addrinfo *res;
+    struct addrinfo hints;
+    struct sockaddr_in sin;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_flags    = AI_PASSIVE;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    //server指定的IP地址可以为空
+    ret = getaddrinfo(ip_addr,port,hints,res);
+
+    if (ret < 0) {
+        fprintf(stderr, "%s for %s:%d\n", gai_strerror(ret), ip_addr, port);
+        return ret;
+    }
+
+    memcpy(&sin, res->ai_addr, sizeof(sin));
+    sin.sin_port = htons((unsigned short)config->port);
+
+    freeaddrinfo(res);//avoid memory leak
+
+    ret = rdma_bind_addr(rdma_ctx->cm_id, (struct sockaddr *)&sin);
+    if (ret != 0){
+        fprintf(stderr," rdma_bind_addr failed\n");
+        return -1;
+    }
+    ret = rdma_listen(rdma_ctx->cm_id, 0); /* backlog=0 is arbitrary */
+    if (ret != 0)
+    {
+        fprintf(stderr, "rdma_listen failed\n");
+        return -1;
+    }
+    return ret;
+}
+
+
+
+int32_t
+fs_rdma_do_reads (fs_rdma_peer_t *peer, fs_rdma_post_t *post,
+                  fs_rdma_read_chunk_t *readch)
+{
+        int32_t             ret       = -1, i = 0, count = 0;
+        size_t              size      = 0;
+        char               *ptr       = NULL;
+        struct iobuf       *iobuf     = NULL;
+        fs_rdma_private_t  *priv      = NULL;
+        struct ibv_sge     *list      = NULL;
+        struct ibv_send_wr *wr        = NULL, *bad_wr = NULL;
+        int                 total_ref = 0;
+        priv = peer->trans->private;
+
+        for (i = 0; readch[i].rc_discrim != 0; i++) {
+                size += readch[i].rc_target.rs_length;
+        }
+
+        if (i == 0) {
+                fs_msg (fs_RDMA_LOG_NAME, fs_LOG_WARNING, 0,
+                        RDMA_MSG_INVALID_CHUNK_TYPE, "message type specified "
+                        "as rdma-read but there are no rdma read-chunks "
+                        "present");
+                goto out;
+        }
+
+        post->ctx.fs_rdma_reads = i;
+        i = 0;
+        iobuf = iobuf_get2 (peer->trans->ctx->iobuf_pool, size);
+        if (iobuf == NULL) {
+                goto out;
+        }
+
+        if (post->ctx.iobref == NULL) {
+                post->ctx.iobref = iobref_new ();
+                if (post->ctx.iobref == NULL) {
+                        iobuf_unref (iobuf);
+                        iobuf = NULL;
+                        goto out;
+                }
+        }
+
+        iobref_add (post->ctx.iobref, iobuf);
+        iobuf_unref (iobuf);
+
+        ptr = iobuf_ptr (iobuf);
+        iobuf = NULL;
+
+        pthread_mutex_lock (&priv->write_mutex);
+        {
+                if (!priv->connected) {
+                        fs_msg (fs_RDMA_LOG_NAME, fs_LOG_WARNING, 0,
+                                RDMA_MSG_PEER_DISCONNECTED, "transport not "
+                                "connected to peer (%s), not doing rdma reads",
+                                peer->trans->peerinfo.identifier);
+                        goto unlock;
+                }
+
+                list = fs_CALLOC (post->ctx.fs_rdma_reads,
+                                sizeof (struct ibv_sge), fs_common_mt_sge);
+
+                if (list == NULL) {
+                       errno =  ENOMEM;
+                       ret = -1;
+                       goto unlock;
+                }
+                wr   = fs_CALLOC (post->ctx.fs_rdma_reads,
+                                sizeof (struct ibv_send_wr), fs_common_mt_wr);
+                if (wr == NULL) {
+                       errno =  ENOMEM;
+                       ret = -1;
+                       goto unlock;
+                }
+                for (i = 0; readch[i].rc_discrim != 0; i++) {
+                        count = post->ctx.count++;
+                        post->ctx.vector[count].iov_base = ptr;
+                        post->ctx.vector[count].iov_len
+                                = readch[i].rc_target.rs_length;
+
+                        ret = __fs_rdma_register_local_mr_for_rdma (peer,
+                                &post->ctx.vector[count], 1, &post->ctx);
+                        if (ret == -1) {
+                                fs_msg (fs_RDMA_LOG_NAME, fs_LOG_WARNING, 0,
+                                        RDMA_MSG_MR_ALOC_FAILED,
+                                        "registering local memory"
+                                       " for rdma read failed");
+                                goto unlock;
+                        }
+
+                        list[i].addr = (unsigned long)
+                                       post->ctx.vector[count].iov_base;
+                        list[i].length = post->ctx.vector[count].iov_len;
+                        list[i].lkey =
+                                post->ctx.mr[post->ctx.mr_count - 1]->lkey;
+
+                        wr[i].wr_id      =
+                                (unsigned long) fs_rdma_post_ref (post);
+                        wr[i].sg_list    = &list[i];
+                        wr[i].next       = &wr[i+1];
+                        wr[i].num_sge    = 1;
+                        wr[i].opcode     = IBV_WR_RDMA_READ;
+                        wr[i].send_flags = IBV_SEND_SIGNALED;
+                        wr[i].wr.rdma.remote_addr =
+                                readch[i].rc_target.rs_offset;
+                        wr[i].wr.rdma.rkey = readch[i].rc_target.rs_handle;
+
+                        ptr += readch[i].rc_target.rs_length;
+                        total_ref++;
+                }
+                wr[i-1].next = NULL;
+                ret = ibv_post_send (peer->qp, wr, &bad_wr);
+                if (ret) {
+                        fs_msg (fs_RDMA_LOG_NAME, fs_LOG_WARNING, 0,
+                                RDMA_MSG_READ_CLIENT_ERROR, "rdma read from "
+                                "client (%s) failed with ret = %d (%s)",
+                                peer->trans->peerinfo.identifier,
+                                ret, (ret > 0) ? strerror (ret) : "");
+
+                        if (!bad_wr) {
+                                ret = -1;
+                                goto unlock;
+                        }
+
+                        for (i = 0; i < post->ctx.fs_rdma_reads; i++) {
+                                if (&wr[i] != bad_wr)
+                                        total_ref--;
+                                else
+                                        break;
+                        }
+
+                        ret = -1;
+                }
+
+        }
+unlock:
+        pthread_mutex_unlock (&priv->write_mutex);
+out:
+        if (list)
+                fs_FREE (list);
+        if (wr)
+                fs_FREE (wr);
+
+        if (ret == -1) {
+                while (total_ref-- > 0)
+                        fs_rdma_post_unref (post);
+
+                if (iobuf != NULL) {
+                        iobuf_unref (iobuf);
+                }
+        }
+
+        return ret;
 }
 
