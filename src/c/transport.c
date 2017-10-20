@@ -656,7 +656,7 @@ fs_rdma_do_reads (fs_rdma_peer_t *peer, fs_rdma_post_t *post,
         ptr = iobuf_ptr (iobuf);
         iobuf = NULL;
 
-        pthread_mutex_lock (&priv->write_mutex);
+
         {
                 if (!priv->connected) {
                         fs_msg (fs_RDMA_LOG_NAME, fs_LOG_WARNING, 0,
@@ -743,7 +743,7 @@ fs_rdma_do_reads (fs_rdma_peer_t *peer, fs_rdma_post_t *post,
 
         }
 unlock:
-        pthread_mutex_unlock (&priv->write_mutex);
+
 out:
         if (list)
                 fs_FREE (list);
